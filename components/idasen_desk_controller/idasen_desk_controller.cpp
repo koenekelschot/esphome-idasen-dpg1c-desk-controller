@@ -2,6 +2,7 @@
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
 #include <string>
+#include <algorithm>
 
 namespace esphome {
 namespace idasen_desk_controller {
@@ -64,10 +65,10 @@ void IdasenDeskControllerComponent::gattc_event_handler(esp_gattc_cb_event_t eve
       this->output_handle_ = chr_output->handle;
 
       // Register for notification
-      auto status_notify =
-          esp_ble_gattc_register_for_notify(this->parent()->get_gattc_if(), this->parent()->get_remote_bda(), this->output_handle_);
-      if (status_notify) {
-        ESP_LOGW(TAG, "esp_ble_gattc_register_for_notify failed, status=%d", status_notify);
+      auto status_notify_output = esp_ble_gattc_register_for_notify(
+          this->parent()->get_gattc_if(), this->parent()->get_remote_bda(), this->output_handle_);
+      if (status_notify_output) {
+        ESP_LOGW(TAG, "esp_ble_gattc_register_for_notify failed, status=%d", status_notify_output);
       }
 
       // Look for input handle
@@ -92,6 +93,24 @@ void IdasenDeskControllerComponent::gattc_event_handler(esp_gattc_cb_event_t eve
       }
       this->control_handle_ = chr_control->handle;
 
+      // Look for dpg handle
+      this->dpg_handle_ = 0;
+      auto chr_dpg = this->parent()->get_characteristic(this->dpg_service_uuid_, this->dpg_char_uuid_);
+      if (chr_dpg == nullptr) {
+        this->status_set_warning();
+        ESP_LOGW(TAG, "No characteristic found at service %s char %s", this->dpg_service_uuid_.to_string().c_str(),
+                 this->dpg_char_uuid_.to_string().c_str());
+        break;
+      }
+      this->dpg_handle_ = chr_dpg->handle;
+
+      // Register for notification
+      auto status_notify_dpg = esp_ble_gattc_register_for_notify(this->parent()->get_gattc_if(),
+                                                                 this->parent()->get_remote_bda(), this->dpg_handle_);
+      if (status_notify_dpg) {
+        ESP_LOGW(TAG, "esp_ble_gattc_register_for_notify failed, status=%d", status_notify_dpg);
+      }
+
       this->set_timeout("desk_init", 5000, [this]() { this->read_value_(this->output_handle_); });
 
       break;
@@ -108,16 +127,45 @@ void IdasenDeskControllerComponent::gattc_event_handler(esp_gattc_cb_event_t eve
         this->status_clear_warning();
         this->publish_cover_state_(param->read.value, param->read.value_len);
       }
+      if (param->read.handle == this->dpg_handle_) {
+        ESP_LOGD(TAG, "[%s] DPG message, status=%d", this->get_name().c_str(), param->read.value);
+        for (int i = 0; i < param->read.value_len; i++)
+          ESP_LOGD(TAG, "[%s] DPG message, index=%d, value=%d", this->get_name().c_str(), i, param->read.value[i]);
+      }
       break;
     }
 
     case ESP_GATTC_NOTIFY_EVT: {
-      if (param->notify.conn_id != this->parent()->get_conn_id() || param->notify.handle != this->output_handle_)
+      if (param->notify.conn_id != this->parent()->get_conn_id())
         break;
-      ESP_LOGV(TAG, "[%s] ESP_GATTC_NOTIFY_EVT: handle=0x%x, value=0x%x", this->get_name().c_str(),
+      ESP_LOGD(TAG, "[%s] ESP_GATTC_NOTIFY_EVT: handle=0x%x, value=0x%x", this->get_name().c_str(),
                param->notify.handle, param->notify.value[0]);
-      this->publish_cover_state_(param->notify.value, param->notify.value_len);
-      break;
+      if (param->notify.handle == this->output_handle_) {
+        this->publish_cover_state_(param->notify.value, param->notify.value_len);
+        break;
+      }
+      if (param->notify.handle == this->dpg_handle_) {
+        // for (int i = 0; i < param->notify.value_len; i++)
+        //   ESP_LOGD(TAG, "[%s] DPG notify, index=%d, value=%d", this->get_name().c_str(), i, param->notify.value[i]);
+
+        if (param->notify.value[2] == 1)
+          return;
+
+        uint8_t array_uint[3 + param->notify.value[1]] = {0x7F, 0x86, 0x80, 0x01};
+        std::copy(param->notify.value + 3, param->notify.value + 3 + param->notify.value[1], array_uint + 4);
+
+        // for (int i = 0; i < param->notify.value_len; i++)
+        //   ESP_LOGD(TAG, "[%s] DPG notify, index=%d, value=%d", this->get_name().c_str(), i, array_uint[i]);
+
+        esp_err_t status = ::esp_ble_gattc_write_char(this->parent()->get_gattc_if(), this->parent()->get_conn_id(),
+                                                      this->dpg_handle_, sizeof(array_uint), array_uint,
+                                                      ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+
+        if (status != ESP_OK) {
+          this->status_set_warning();
+          ESP_LOGW(TAG, "[%s] Error sending write request for cover, status=%d", this->get_name().c_str(), status);
+        }
+      }
     }
 
     case ESP_GATTC_REG_FOR_NOTIFY_EVT: {
@@ -138,8 +186,8 @@ void IdasenDeskControllerComponent::write_value_(uint16_t handle, unsigned short
   data[0] = value;
   data[1] = value >> 8;
 
-  esp_err_t status = ::esp_ble_gattc_write_char(this->parent()->get_gattc_if(), this->parent()->get_conn_id(), handle, 2, data,
-                                                ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+  esp_err_t status = ::esp_ble_gattc_write_char(this->parent()->get_gattc_if(), this->parent()->get_conn_id(), handle,
+                                                2, data, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
 
   if (status != ESP_OK) {
     this->status_set_warning();
@@ -148,8 +196,8 @@ void IdasenDeskControllerComponent::write_value_(uint16_t handle, unsigned short
 }
 
 void IdasenDeskControllerComponent::read_value_(uint16_t handle) {
-  auto status_read =
-      esp_ble_gattc_read_char(this->parent()->get_gattc_if(), this->parent()->get_conn_id(), handle, ESP_GATT_AUTH_REQ_NONE);
+  auto status_read = esp_ble_gattc_read_char(this->parent()->get_gattc_if(), this->parent()->get_conn_id(), handle,
+                                             ESP_GATT_AUTH_REQ_NONE);
   if (status_read) {
     this->status_set_warning();
     ESP_LOGW(TAG, "[%s] Error sending read request for cover, status=%d", this->get_name().c_str(), status_read);
@@ -161,6 +209,7 @@ cover::CoverTraits IdasenDeskControllerComponent::get_traits() {
   traits.set_is_assumed_state(false);
   traits.set_supports_position(true);
   traits.set_supports_tilt(false);
+  traits.set_supports_stop(true);
   return traits;
 }
 
@@ -222,6 +271,8 @@ void IdasenDeskControllerComponent::control(const cover::CoverCall &call) {
   if (this->notify_disable_) {
     this->read_value_(this->output_handle_);
   }
+
+  this->wakeup_(this->dpg_handle_);
 
   if (call.get_position().has_value()) {
     if (this->current_operation != cover::COVER_OPERATION_IDLE) {
@@ -296,6 +347,25 @@ bool IdasenDeskControllerComponent::is_at_target_() const {
     default:
       return true;
   }
+}
+
+void IdasenDeskControllerComponent::wakeup_(uint16_t handle) {
+  uint8_t array_uint[3] = {0x7F, 0x86, 0x00};
+  for (int i = 0; i < sizeof(array_uint); i++)
+    ESP_LOGD(TAG, "[%s] DPG wakeup command, index=%d, value=%d", this->get_name().c_str(), i, array_uint[i]);
+  ESP_LOGD(TAG, "[%s] DPG wakeup command, size=%d", this->get_name().c_str(), sizeof(array_uint));
+  esp_err_t status =
+      ::esp_ble_gattc_write_char(this->parent()->get_gattc_if(), this->parent()->get_conn_id(), handle,
+                                 sizeof(array_uint), array_uint, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+
+  this->write_value_(this->control_handle_, 0xFE);
+
+  if (status != ESP_OK) {
+    this->status_set_warning();
+    ESP_LOGW(TAG, "[%s] Error sending write request for cover, status=%d", this->get_name().c_str(), status);
+  }
+
+  // this->read_value_(this->dpg_handle_);
 }
 
 espbt::ESPBTUUID uuid128_from_string(std::string value) {

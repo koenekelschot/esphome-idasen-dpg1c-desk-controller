@@ -51,6 +51,10 @@ class IdasenDeskControllerComponent : public Component, public cover::Cover, pub
   espbt::ESPBTUUID control_char_uuid_ = uuid128_from_string("99fa0002-338a-1024-8a49-009c0215f78a");
   uint16_t control_handle_;
 
+  espbt::ESPBTUUID dpg_service_uuid_ = uuid128_from_string("99fa0010-338a-1024-8a49-009c0215f78a");
+  espbt::ESPBTUUID dpg_char_uuid_ = uuid128_from_string("99fa0011-338a-1024-8a49-009c0215f78a");
+  uint16_t dpg_handle_;
+
   bool controlled_ = false;
   float position_target_;
 
@@ -65,6 +69,7 @@ class IdasenDeskControllerComponent : public Component, public cover::Cover, pub
   void start_move_torwards_();
   void move_torwards_();
   void stop_move_();
+  void wakeup_(uint16_t handle);
 };
 }  // namespace idasen_desk_controller
 }  // namespace esphome
