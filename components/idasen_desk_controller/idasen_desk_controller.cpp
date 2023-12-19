@@ -2,6 +2,7 @@
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
 #include <string>
+#include <algorithm>
 
 namespace esphome {
 namespace idasen_desk_controller {
@@ -64,10 +65,10 @@ void IdasenDeskControllerComponent::gattc_event_handler(esp_gattc_cb_event_t eve
       this->output_handle_ = chr_output->handle;
 
       // Register for notification
-      auto status_notify =
-          esp_ble_gattc_register_for_notify(this->parent()->get_gattc_if(), this->parent()->get_remote_bda(), this->output_handle_);
-      if (status_notify) {
-        ESP_LOGW(TAG, "esp_ble_gattc_register_for_notify failed, status=%d", status_notify);
+      auto status_notify_output = esp_ble_gattc_register_for_notify(
+          this->parent()->get_gattc_if(), this->parent()->get_remote_bda(), this->output_handle_);
+      if (status_notify_output) {
+        ESP_LOGW(TAG, "esp_ble_gattc_register_for_notify failed, status=%d", status_notify_output);
       }
 
       // Look for input handle
@@ -92,6 +93,24 @@ void IdasenDeskControllerComponent::gattc_event_handler(esp_gattc_cb_event_t eve
       }
       this->control_handle_ = chr_control->handle;
 
+      // Look for dpg handle
+      this->dpg_handle_ = 0;
+      auto chr_dpg = this->parent()->get_characteristic(this->dpg_service_uuid_, this->dpg_char_uuid_);
+      if (chr_dpg == nullptr) {
+        this->status_set_warning();
+        ESP_LOGW(TAG, "No characteristic found at service %s char %s", this->dpg_service_uuid_.to_string().c_str(),
+                 this->dpg_char_uuid_.to_string().c_str());
+        break;
+      }
+      this->dpg_handle_ = chr_dpg->handle;
+
+      // Register for notification
+      auto status_notify_dpg = esp_ble_gattc_register_for_notify(this->parent()->get_gattc_if(),
+                                                                 this->parent()->get_remote_bda(), this->dpg_handle_);
+      if (status_notify_dpg) {
+        ESP_LOGW(TAG, "esp_ble_gattc_register_for_notify failed, status=%d", status_notify_dpg);
+      }
+
       this->set_timeout("desk_init", 5000, [this]() { this->read_value_(this->output_handle_); });
 
       break;
@@ -108,16 +127,32 @@ void IdasenDeskControllerComponent::gattc_event_handler(esp_gattc_cb_event_t eve
         this->status_clear_warning();
         this->publish_cover_state_(param->read.value, param->read.value_len);
       }
+      if (param->read.handle == this->dpg_handle_) {
+        ESP_LOGD(TAG, "[%s] DPG message, status=%d", this->get_name().c_str(), param->read.value);
+        for (int i = 0; i < param->read.value_len; i++)
+          ESP_LOGD(TAG, "[%s] DPG message, index=%d, value=%d", this->get_name().c_str(), i, param->read.value[i]);
+      }
       break;
     }
 
     case ESP_GATTC_NOTIFY_EVT: {
-      if (param->notify.conn_id != this->parent()->get_conn_id() || param->notify.handle != this->output_handle_)
+      if (param->notify.conn_id != this->parent()->get_conn_id())
         break;
-      ESP_LOGV(TAG, "[%s] ESP_GATTC_NOTIFY_EVT: handle=0x%x, value=0x%x", this->get_name().c_str(),
+      ESP_LOGD(TAG, "[%s] ESP_GATTC_NOTIFY_EVT: handle=0x%x, value=0x%x", this->get_name().c_str(),
                param->notify.handle, param->notify.value[0]);
-      this->publish_cover_state_(param->notify.value, param->notify.value_len);
-      break;
+      if (param->notify.handle == this->output_handle_) {
+        this->publish_cover_state_(param->notify.value, param->notify.value_len);
+        break;
+      }
+      if (param->notify.handle == this->dpg_handle_) {
+        // https://github.com/rhyst/linak-controller/issues/32#issuecomment-1784055470
+        if (param->notify.value[2] == 1)
+          return;
+
+        uint8_t dpg_userid[3 + param->notify.value[1]] = {0x7F, 0x86, 0x80, 0x01};
+        std::copy(param->notify.value + 3, param->notify.value + 3 + param->notify.value[1], dpg_userid + 4);
+        this->write_value_(this->dpg_handle_, dpg_userid, sizeof(dpg_userid));
+      }
     }
 
     case ESP_GATTC_REG_FOR_NOTIFY_EVT: {
@@ -133,13 +168,9 @@ void IdasenDeskControllerComponent::gattc_event_handler(esp_gattc_cb_event_t eve
   }
 }
 
-void IdasenDeskControllerComponent::write_value_(uint16_t handle, unsigned short value) {
-  uint8_t data[2];
-  data[0] = value;
-  data[1] = value >> 8;
-
-  esp_err_t status = ::esp_ble_gattc_write_char(this->parent()->get_gattc_if(), this->parent()->get_conn_id(), handle, 2, data,
-                                                ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+void IdasenDeskControllerComponent::write_value_(uint16_t handle, uint8_t *value, uint8_t value_len) {
+  esp_err_t status = ::esp_ble_gattc_write_char(this->parent()->get_gattc_if(), this->parent()->get_conn_id(), handle,
+                                                value_len, value, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
 
   if (status != ESP_OK) {
     this->status_set_warning();
@@ -148,8 +179,8 @@ void IdasenDeskControllerComponent::write_value_(uint16_t handle, unsigned short
 }
 
 void IdasenDeskControllerComponent::read_value_(uint16_t handle) {
-  auto status_read =
-      esp_ble_gattc_read_char(this->parent()->get_gattc_if(), this->parent()->get_conn_id(), handle, ESP_GATT_AUTH_REQ_NONE);
+  auto status_read = esp_ble_gattc_read_char(this->parent()->get_gattc_if(), this->parent()->get_conn_id(), handle,
+                                             ESP_GATT_AUTH_REQ_NONE);
   if (status_read) {
     this->status_set_warning();
     ESP_LOGW(TAG, "[%s] Error sending read request for cover, status=%d", this->get_name().c_str(), status_read);
@@ -161,6 +192,7 @@ cover::CoverTraits IdasenDeskControllerComponent::get_traits() {
   traits.set_is_assumed_state(false);
   traits.set_supports_position(true);
   traits.set_supports_tilt(false);
+  traits.set_supports_stop(true);
   return traits;
 }
 
@@ -223,6 +255,8 @@ void IdasenDeskControllerComponent::control(const cover::CoverCall &call) {
     this->read_value_(this->output_handle_);
   }
 
+  this->wakeup_(this->dpg_handle_);
+
   if (call.get_position().has_value()) {
     if (this->current_operation != cover::COVER_OPERATION_IDLE) {
       this->stop_move_();
@@ -256,27 +290,31 @@ void IdasenDeskControllerComponent::start_move_torwards_() {
     this->not_moving_loop_ = 0;
   }
   if (false == this->use_only_up_down_command_) {
-    this->write_value_(this->control_handle_, 0xFE);
-    this->write_value_(this->control_handle_, 0xFF);
+    this->write_value_(this->control_handle_, this->command_wakeup, sizeof(this->command_wakeup));
+    this->write_value_(this->control_handle_, this->command_stop, sizeof(this->command_stop));
   }
 }
 
 void IdasenDeskControllerComponent::move_torwards_() {
   if (this->use_only_up_down_command_) {
     if (this->current_operation == cover::COVER_OPERATION_OPENING) {
-      this->write_value_(this->control_handle_, 0x47);
+      this->write_value_(this->control_handle_, this->command_up, sizeof(this->command_up));
     } else if (this->current_operation == cover::COVER_OPERATION_CLOSING) {
-      this->write_value_(this->control_handle_, 0x46);
+      this->write_value_(this->control_handle_, this->command_down, sizeof(this->command_down));
     }
   } else {
-    this->write_value_(this->input_handle_, transform_position_to_height(this->position_target_));
+    unsigned short height_short = transform_position_to_height(this->position_target_);
+    uint8_t height[2];
+    height[0] = height_short;
+    height[1] = height_short >> 8;
+    this->write_value_(this->input_handle_, height, 2);
   }
 }
 
 void IdasenDeskControllerComponent::stop_move_() {
-  this->write_value_(this->control_handle_, 0xFF);
+  this->write_value_(this->control_handle_, this->command_stop, sizeof(this->command_stop));
   if (false == this->use_only_up_down_command_) {
-    this->write_value_(this->input_handle_, 0x8001);
+    this->write_value_(this->input_handle_, this->input_command, sizeof(this->input_command));
   }
 
   this->current_operation = cover::COVER_OPERATION_IDLE;
@@ -296,6 +334,11 @@ bool IdasenDeskControllerComponent::is_at_target_() const {
     default:
       return true;
   }
+}
+
+void IdasenDeskControllerComponent::wakeup_(uint16_t handle) {
+  this->write_value_(this->dpg_handle_, this->dpg_command_userid, sizeof(this->dpg_command_userid));
+  this->write_value_(this->control_handle_, this->command_wakeup, sizeof(this->command_wakeup));
 }
 
 espbt::ESPBTUUID uuid128_from_string(std::string value) {

@@ -51,13 +51,24 @@ class IdasenDeskControllerComponent : public Component, public cover::Cover, pub
   espbt::ESPBTUUID control_char_uuid_ = uuid128_from_string("99fa0002-338a-1024-8a49-009c0215f78a");
   uint16_t control_handle_;
 
+  espbt::ESPBTUUID dpg_service_uuid_ = uuid128_from_string("99fa0010-338a-1024-8a49-009c0215f78a");
+  espbt::ESPBTUUID dpg_char_uuid_ = uuid128_from_string("99fa0011-338a-1024-8a49-009c0215f78a");
+  uint16_t dpg_handle_;
+
   bool controlled_ = false;
   float position_target_;
 
   bool notify_disable_ = true;
   int not_moving_loop_ = 0;
 
-  void write_value_(uint16_t handle, unsigned short value);
+  uint8_t command_up[2] = {0x47, 0x00};
+  uint8_t command_down[2] = {0x46, 0x00};
+  uint8_t command_stop[2] = {0xFF, 0x00};
+  uint8_t command_wakeup[2] = {0xFE, 0x00};
+  uint8_t dpg_command_userid[3] = {0x7F, 0x86, 0x00};
+  uint8_t input_command[2] = {0x80, 0x01};
+
+  void write_value_(uint16_t handle, uint8_t *value, uint8_t value_len);
   void read_value_(uint16_t handle);
   void publish_cover_state_(uint8_t *value, uint16_t value_len);
   void move_desk_();
@@ -65,6 +76,7 @@ class IdasenDeskControllerComponent : public Component, public cover::Cover, pub
   void start_move_torwards_();
   void move_torwards_();
   void stop_move_();
+  void wakeup_(uint16_t handle);
 };
 }  // namespace idasen_desk_controller
 }  // namespace esphome
