@@ -153,6 +153,7 @@ void IdasenDeskControllerComponent::gattc_event_handler(esp_gattc_cb_event_t eve
         std::copy(param->notify.value + 3, param->notify.value + 3 + param->notify.value[1], dpg_userid + 4);
         this->write_value_(this->dpg_handle_, dpg_userid, sizeof(dpg_userid));
       }
+      break;
     }
 
     case ESP_GATTC_REG_FOR_NOTIFY_EVT: {
@@ -331,6 +332,7 @@ bool IdasenDeskControllerComponent::is_at_target_() const {
       if (this->notify_disable_) {
         return !this->controlled_;
       }
+      return true;
     default:
       return true;
   }
